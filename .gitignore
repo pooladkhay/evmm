@@ -56,3 +56,4 @@ dkms.conf
 
 .cache
 compile_commands.json
+cspell.json
