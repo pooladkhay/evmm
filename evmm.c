@@ -4,6 +4,9 @@
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/printk.h>
+#include <linux/uaccess.h>
+
+#include "evmm.h"
 
 long evmm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg);
 
@@ -21,11 +24,23 @@ static struct miscdevice evmm_dev = {
 
 long evmm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 {
-	int r = 0; //-EINVAL;
-
 	pr_info("ioctl called.\n");
 
-	return r;
+	void __user *argp = (void __user *)arg;
+
+	switch (ioctl) {
+	case EVMM_GET_API_VERSION:
+		if (!arg)
+			return -EINVAL;
+
+		int api_version = EVMM_API_VERSION;
+		if (copy_to_user(argp, &api_version, sizeof(api_version)))
+			return -EFAULT;
+
+		return 0;
+	default:
+		return -ENOTTY;
+	}
 }
 
 static int __init evmm_init(void)
