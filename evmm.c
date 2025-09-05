@@ -1,4 +1,5 @@
 #include <asm/msr.h>
+#include <asm/paravirt.h>
 #include <linux/cpufeature.h>
 #include <linux/fs.h>
 #include <linux/init.h>
@@ -84,6 +85,26 @@ static int __init evmm_init(void)
 		pr_err("evmm: VMX is disabled in BIOS/UEFI.\n");
 		return -ENODEV;
 	}
+
+	/* This happens only on one core */
+
+	cr4_set_bits(X86_CR4_VMXE);
+
+	unsigned long cr0 = read_cr0();
+	unsigned long cr4 = __read_cr4();
+
+	u64 cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1;
+
+	rdmsrq_safe(MSR_IA32_VMX_CR0_FIXED0, &cr0_fixed0);
+	rdmsrq_safe(MSR_IA32_VMX_CR0_FIXED1, &cr0_fixed1);
+	rdmsrq_safe(MSR_IA32_VMX_CR4_FIXED0, &cr4_fixed0);
+	rdmsrq_safe(MSR_IA32_VMX_CR4_FIXED1, &cr4_fixed1);
+
+	cr0 = (cr0 | cr0_fixed0) & cr0_fixed1;
+	cr4 = (cr4 | cr4_fixed0) & cr4_fixed1;
+
+	write_cr0(cr0);
+	__write_cr4(cr4);
 
 	ret = misc_register(&evmm_dev);
 	if (ret) {
