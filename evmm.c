@@ -1,5 +1,6 @@
 #include <asm/msr.h>
 #include <asm/paravirt.h>
+#include <linux/atomic.h>
 #include <linux/cpufeature.h>
 #include <linux/fs.h>
 #include <linux/init.h>
@@ -8,12 +9,15 @@
 #include <linux/module.h>
 #include <linux/printk.h>
 #include <linux/processor.h>
+#include <linux/smp.h>
 #include <linux/uaccess.h>
 
 #include "evmm.h"
 
 static long evmm_ioctl(struct file *filp, unsigned int ioctl,
 		       unsigned long arg);
+
+static void __init evmm_init_cpu(void *info);
 
 static struct file_operations evmm_ops = {
     .unlocked_ioctl = evmm_ioctl,
@@ -48,45 +52,44 @@ static long evmm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 	}
 }
 
-static int __init evmm_init(void)
+static void __init evmm_init_cpu(void *info)
 {
-	pr_info("evmm: module init.\n");
-
-#ifndef CONFIG_X86_64
-	pr_warn("evmm: only supports Intel x86_64 CPUs.");
-	return -ENODEV;
-#else
-	struct cpuinfo_x86 *cpu = &boot_cpu_data;
-	u64 feature_control;
+	atomic_t *init_cpu_err = (atomic_t *)info;
 	int ret;
+	int id = smp_processor_id();
+	struct cpuinfo_x86 *cpu = &cpu_data(id);
+	u64 feature_control;
 
 	if (cpu->x86_vendor != X86_VENDOR_INTEL) {
 		pr_err("evmm: only Intel CPUs are supported.\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto err;
 	}
 
 	if (!boot_cpu_has(X86_FEATURE_VMX)) {
 		pr_err("evmm: Intel VT-x (VMX) is not supported.\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto err;
 	}
 
 	ret = rdmsrq_safe(MSR_IA32_FEAT_CTL, &feature_control);
 	if (ret) {
 		pr_err("evmm: failed to read Feature Control MSR: %d\n", ret);
-		return -EIO;
+		ret = -EIO;
+		goto err;
 	}
 
 	if (!(feature_control & FEAT_CTL_LOCKED)) {
 		pr_err("evmm: Feature Control MSR is not locked.\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto err;
 	}
 
 	if (!(feature_control & FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX)) {
 		pr_err("evmm: VMX is disabled in BIOS/UEFI.\n");
-		return -ENODEV;
+		ret = -ENODEV;
+		goto err;
 	}
-
-	/* This happens only on one core */
 
 	cr4_set_bits(X86_CR4_VMXE);
 
@@ -106,9 +109,35 @@ static int __init evmm_init(void)
 	write_cr0(cr0);
 	__write_cr4(cr4);
 
+	pr_info("evmm: cpu #%d init done.\n", id);
+	return;
+
+err:
+	atomic_set(init_cpu_err, ret);
+}
+
+static int __init evmm_init(void)
+{
+	pr_info("evmm: module init.\n");
+
+#ifndef CONFIG_X86_64
+	pr_warn("evmm: only supports Intel x86_64 CPUs.");
+	return -ENODEV;
+#else
+	int ret;
+	atomic_t init_cpu_err;
+
+	atomic_set(&init_cpu_err, 0);
+
+	on_each_cpu(evmm_init_cpu, &init_cpu_err, 1);
+
+	int cpu_init_err = atomic_read(&init_cpu_err);
+	if (cpu_init_err)
+		return cpu_init_err;
+
 	ret = misc_register(&evmm_dev);
 	if (ret) {
-		pr_err("evmm: Failed to register misc device: %d\n", ret);
+		pr_err("evmm: failed to register misc device: %d\n", ret);
 		return ret;
 	}
 
