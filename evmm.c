@@ -66,7 +66,7 @@ static void __init evmm_init_cpu(void *info)
 		goto err;
 	}
 
-	if (!boot_cpu_has(X86_FEATURE_VMX)) {
+	if (!cpu_has(cpu, X86_FEATURE_VMX)) {
 		pr_err("evmm: Intel VT-x (VMX) is not supported.\n");
 		ret = -ENODEV;
 		goto err;
