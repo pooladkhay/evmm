@@ -18,7 +18,7 @@ all: build auto-install status
 
 build:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
-	$(SIGN_TOOL) sha256 $(SIGN_KEY) $(SIGN_CERT) $(PWD)/evmm.ko
+	$(SIGN_TOOL) sha256 $(SIGN_KEY) $(SIGN_CERT) $(PWD)/$(MODULE_NAME).ko
 
 auto-install: build
 	@echo "Checking module status..."
@@ -27,7 +27,7 @@ auto-install: build
 		sudo rmmod $(MODULE_NAME) || true; \
 	fi
 	@echo "Installing module $(MODULE_NAME)..."
-	sudo insmod $(PWD)/evmm.ko
+	sudo insmod $(PWD)/$(MODULE_NAME).ko
 	@echo "Module installed successfully!"
 
 status:
@@ -46,10 +46,16 @@ status:
 		echo "✗ /dev/$(MODULE_NAME) does not exist"; \
 	fi
 
+install:
+	sudo insmod $(MODULE_NAME).ko
+
 remove:
 	sudo rmmod $(MODULE_NAME)
+
+dmesg:
+	sudo dmesg -c && clear && sudo dmesg -w
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
-.PHONY: all build auto-install status remove clean
+.PHONY: all build auto-install status install remove dmesg clean
