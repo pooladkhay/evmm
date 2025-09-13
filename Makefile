@@ -16,8 +16,12 @@ MODULE_NAME := evmm
 
 all: build auto-install status
 
+sign: build sign-module auto-install status
+
 build:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+sign-module: 
 	$(SIGN_TOOL) sha256 $(SIGN_KEY) $(SIGN_CERT) $(PWD)/$(MODULE_NAME).ko
 
 auto-install: build
@@ -58,4 +62,4 @@ dmesg:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
-.PHONY: all build auto-install status install remove dmesg clean
+.PHONY: all sign build sign-module auto-install status install remove dmesg clean
