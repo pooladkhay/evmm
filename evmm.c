@@ -16,9 +16,16 @@
 #include <linux/processor.h>
 #include <linux/smp.h>
 #include <linux/uaccess.h>
+#include <linux/version.h>
 
 #include "evmm.h"
 #include "vmx.h"
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#define evmm_rdmsr(rdmsr_args...) rdmsrq_safe(rdmsr_args)
+#else
+#define evmm_rdmsr(rdmsr_args...) rdmsrl_safe(rdmsr_args)
+#endif
 
 static long evmm_ioctl(struct file *filp, unsigned int ioctl,
 		       unsigned long arg);
@@ -89,7 +96,7 @@ static int evmm_cpu_check_vmx(int cpu_id)
 		return -ENODEV;
 	}
 
-	ret = rdmsrq_safe(MSR_IA32_FEAT_CTL, &feature_control);
+	ret = evmm_rdmsr(MSR_IA32_FEAT_CTL, &feature_control);
 	if (ret) {
 		pr_err("evmm: failed to read Feature Control MSR: %d\n", ret);
 		return -EIO;
@@ -118,28 +125,28 @@ static int evmm_cpu_set_cr0_cr4(struct evmm_percpu_config *conf)
 
 	u64 cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1;
 
-	ret = rdmsrq_safe(MSR_IA32_VMX_CR0_FIXED0, &cr0_fixed0);
+	ret = evmm_rdmsr(MSR_IA32_VMX_CR0_FIXED0, &cr0_fixed0);
 	if (ret) {
 		pr_err("evmm: failed to read 'MSR_IA32_VMX_CR0_FIXED0': %d\n",
 		       ret);
 		return -EIO;
 	}
 
-	ret = rdmsrq_safe(MSR_IA32_VMX_CR0_FIXED1, &cr0_fixed1);
+	ret = evmm_rdmsr(MSR_IA32_VMX_CR0_FIXED1, &cr0_fixed1);
 	if (ret) {
 		pr_err("evmm: failed to read 'MSR_IA32_VMX_CR0_FIXED1': %d\n",
 		       ret);
 		return -EIO;
 	}
 
-	ret = rdmsrq_safe(MSR_IA32_VMX_CR4_FIXED0, &cr4_fixed0);
+	ret = evmm_rdmsr(MSR_IA32_VMX_CR4_FIXED0, &cr4_fixed0);
 	if (ret) {
 		pr_err("evmm: failed to read 'MSR_IA32_VMX_CR4_FIXED0': %d\n",
 		       ret);
 		return -EIO;
 	}
 
-	ret = rdmsrq_safe(MSR_IA32_VMX_CR4_FIXED1, &cr4_fixed1);
+	ret = evmm_rdmsr(MSR_IA32_VMX_CR4_FIXED1, &cr4_fixed1);
 	if (ret) {
 		pr_err("evmm: failed to read 'MSR_IA32_VMX_CR4_FIXED1': %d\n",
 		       ret);
@@ -177,7 +184,7 @@ static int evmm_cpu_alloc_mem(struct evmm_percpu_config *conf)
 	conf->vmcs_region = vmcs_region;
 
 	u64 basic_msr;
-	ret = rdmsrq_safe(MSR_IA32_VMX_BASIC, &basic_msr);
+	ret = evmm_rdmsr(MSR_IA32_VMX_BASIC, &basic_msr);
 	if (ret) {
 		pr_err("evmm: failed to read 'MSR_IA32_VMX_BASIC': %d\n", ret);
 		return -EIO;
