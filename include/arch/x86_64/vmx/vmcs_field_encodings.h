@@ -1,3 +1,7 @@
+
+#ifndef _EVMM_ARCH_X86_64_VMX_VMCS_FIELD_ENCODINGS_H_
+#define _EVMM_ARCH_X86_64_VMX_VMCS_FIELD_ENCODINGS_H_
+
 #include <linux/types.h>
 
 /*
@@ -391,3 +395,5 @@ enum evmm_vmcs_vmexit_info_encodings {
 	/* No read-only 16-bit fields are available */
 
 };
+
+#endif /* _EVMM_ARCH_X86_64_VMX_VMCS_FIELD_ENCODINGS_H_ */

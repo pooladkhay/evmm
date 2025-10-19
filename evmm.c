@@ -1,7 +1,6 @@
 #define DEBUG
 #include <asm/io.h>
 #include <asm/msr.h>
-#include <asm/paravirt.h>
 #include <asm/processor-flags.h>
 #include <linux/atomic.h>
 #include <linux/cpufeature.h>
@@ -18,8 +17,13 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 
-#include "evmm.h"
-#include "vmx.h"
+#include "include/evmm.h"
+#include "include/arch/x86_64/vmx/msr.h"
+#include "include/arch/x86_64/vmx/vmx.h"
+
+MODULE_AUTHOR("MJ Pooladkhay <mj@pooladkhay.com>");
+MODULE_DESCRIPTION("An experimental Virtual Machine Monitor");
+MODULE_LICENSE("GPL");
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
 #define evmm_rdmsr(rdmsr_args...) rdmsrq_safe(rdmsr_args)
@@ -30,19 +34,11 @@
 static long evmm_ioctl(struct file *filp, unsigned int ioctl,
 		       unsigned long arg);
 
-struct evmm_percpu_config {
-	unsigned long orig_cr0;
-	unsigned long orig_cr4;
-	void *vmxon_region;
-	void *vmcs_region;
-	bool cr_saved;
-	bool vmxon;
-};
-static DEFINE_PER_CPU(struct evmm_percpu_config, evmm_percpu_config) = {
+static DEFINE_PER_CPU(struct evmm_percpu_config, percpu_config) = {
     .orig_cr0 = 0,
     .orig_cr4 = 0,
     .vmxon_region = NULL,
-    .vmcs_region = NULL,
+    .vmxon_region_phys = 0,
     .vmxon = false,
     .cr_saved = false,
 };
@@ -115,13 +111,9 @@ static int evmm_cpu_check_vmx(int cpu_id)
 	return ret;
 }
 
-static int evmm_cpu_set_cr0_cr4(struct evmm_percpu_config *conf)
+static int evmm_cpu_set_cr0_cr4(struct evmm_percpu_config *cpu_conf)
 {
 	int ret = 0;
-
-	conf->orig_cr0 = read_cr0();
-	conf->orig_cr4 = __read_cr4();
-	conf->cr_saved = true;
 
 	u64 cr0_fixed0, cr0_fixed1, cr4_fixed0, cr4_fixed1;
 
@@ -153,9 +145,13 @@ static int evmm_cpu_set_cr0_cr4(struct evmm_percpu_config *conf)
 		return -EIO;
 	}
 
-	// fixed MSRs also set 'X86_CR4_VMXE' bit to the correct value
-	unsigned long cr0 = (conf->orig_cr0 | cr0_fixed0) & cr0_fixed1;
-	unsigned long cr4 = (conf->orig_cr4 | cr4_fixed0) & cr4_fixed1;
+	cpu_conf->orig_cr0 = read_cr0();
+	cpu_conf->orig_cr4 = __read_cr4();
+	cpu_conf->cr_saved = true;
+
+	// fixed MSRs also set 'X86_CR4_VMXE' bit to the correct value (1)
+	unsigned long cr0 = (cpu_conf->orig_cr0 | cr0_fixed0) & cr0_fixed1;
+	unsigned long cr4 = (cpu_conf->orig_cr4 | cr4_fixed0) & cr4_fixed1;
 
 	write_cr0(cr0);
 	__write_cr4(cr4);
@@ -163,83 +159,55 @@ static int evmm_cpu_set_cr0_cr4(struct evmm_percpu_config *conf)
 	return ret;
 }
 
-static int evmm_cpu_alloc_mem(struct evmm_percpu_config *conf)
+static int evmm_cpu_vmxon(struct evmm_percpu_config *cpu_conf)
 {
 	int ret = 0;
+	int asm_err;
 
-	void *vmxon_region = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
-	if (!vmxon_region) {
+	cpu_conf->vmxon_region = (struct evmm_vmxon_region *)__get_free_page(
+	    GFP_KERNEL | __GFP_ZERO);
+	if (!cpu_conf->vmxon_region) {
 		pr_err("evmm: failed to allocate vmxon region.\n");
 		return -ENOMEM;
 	};
-	conf->vmxon_region = vmxon_region;
 
-	void *vmcs_region = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
-	if (!vmcs_region) {
-		pr_err("evmm: failed to allocate vmcs region.\n");
-		free_page((unsigned long)vmxon_region);
-		conf->vmxon_region = NULL;
-		return -ENOMEM;
-	};
-	conf->vmcs_region = vmcs_region;
-
-	u64 basic_msr;
-	ret = evmm_rdmsr(MSR_IA32_VMX_BASIC, &basic_msr);
+	union ia32_vmx_basic_msr basic_msr;
+	ret = evmm_rdmsr(MSR_IA32_VMX_BASIC, &basic_msr.full);
 	if (ret) {
 		pr_err("evmm: failed to read 'MSR_IA32_VMX_BASIC': %d\n", ret);
-		return -EIO;
+		ret = -EIO;
+		goto err_free_vmxon;
 	}
 
-	u32 revision_id = (u32)(basic_msr & 0x7fffffff);
+	cpu_conf->vmxon_region->header.bits.revision_identifier =
+	    basic_msr.bits.vmcs_revision_identifier;
+	cpu_conf->vmxon_region->header.bits.must_be_zeroed = 0;
 
-	*(u32 *)vmxon_region = revision_id;
-	*(u32 *)vmcs_region = revision_id;
-
-	return ret;
-}
-
-static int evmm_cpu_enter_vmx(struct evmm_percpu_config *conf)
-{
-
-	int ret = 0;
-
-	uint8_t asm_err;
-
-	phys_addr_t vmxon_phys_addr = virt_to_phys(conf->vmxon_region);
-	if (!IS_ALIGNED((unsigned long)vmxon_phys_addr, 4096)) {
+	cpu_conf->vmxon_region_phys = virt_to_phys(cpu_conf->vmxon_region);
+	if (!IS_ALIGNED((unsigned long)cpu_conf->vmxon_region_phys,
+			PAGE_SIZE)) {
 		pr_err("evmm: 'vmxon_phys_addr' is not aligned to 4kb "
 		       "boundary.\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto err_free_vmxon;
 	}
 
-	phys_addr_t vmcs_phys_addr = virt_to_phys(conf->vmcs_region);
-	if (!IS_ALIGNED((unsigned long)vmcs_phys_addr, 4096)) {
-		pr_err("evmm: 'vmcs_phys_addr' is not aligned to 4kb "
-		       "boundary.\n");
-		return -EINVAL;
-	}
-
-	asm_err = vmxon((uint64_t)vmxon_phys_addr);
+	asm_err = vmxon(cpu_conf->vmxon_region_phys);
 	if (asm_err) {
 		pr_err("evmm: 'vmxon' failed with %d - potential cause: CPU is "
 		       "already in vmx-root operation.\n",
 		       asm_err);
-		return -EIO;
+		ret = -EIO;
+		goto err_free_vmxon;
 	}
-	conf->vmxon = true;
+	cpu_conf->vmxon = true;
 
-	asm_err = vmclear((uint64_t)vmcs_phys_addr);
-	if (asm_err) {
-		pr_err("evmm: 'vmclear' failed with %d.\n", asm_err);
-		return -EIO;
-	}
+	return 0;
 
-	asm_err = vmptrld((uint64_t)vmcs_phys_addr);
-	if (asm_err) {
-		pr_err("evmm: 'vmptrld' failed with %d.\n", asm_err);
-		return -EIO;
-	}
-
+err_free_vmxon:
+	free_page((unsigned long)cpu_conf->vmxon_region);
+	cpu_conf->vmxon_region = NULL;
+	cpu_conf->vmxon_region_phys = 0;
 	return ret;
 }
 
@@ -247,7 +215,7 @@ static void __init evmm_per_cpu_init(void *info)
 {
 	int ret;
 	int id = smp_processor_id();
-	struct evmm_percpu_config *conf = this_cpu_ptr(&evmm_percpu_config);
+	struct evmm_percpu_config *cpu_conf = this_cpu_ptr(&percpu_config);
 	atomic_t *init_cpu_err = (atomic_t *)info;
 
 	/* check if cpu is intel and supports VMX */
@@ -256,17 +224,12 @@ static void __init evmm_per_cpu_init(void *info)
 		goto err;
 
 	/* save original then cr0 and cr4 based on fixed0 and fixed1 MSRs */
-	ret = evmm_cpu_set_cr0_cr4(conf);
+	ret = evmm_cpu_set_cr0_cr4(cpu_conf);
 	if (ret)
 		goto err;
 
-	/* allocate per-cpu memory regions */
-	ret = evmm_cpu_alloc_mem(conf);
-	if (ret)
-		goto err;
-
-	/* execute VMXON, VMCLEAR and VMPTRLD */
-	ret = evmm_cpu_enter_vmx(conf);
+	/* allocate per-cpu memory region for vmxon and enter vmx */
+	ret = evmm_cpu_vmxon(cpu_conf);
 	if (ret)
 		goto err;
 
@@ -281,8 +244,7 @@ static void evmm_per_cpu_exit(void *info)
 {
 	int cpu_id = smp_processor_id();
 
-	struct evmm_percpu_config *cpu_conf;
-	cpu_conf = this_cpu_ptr(&evmm_percpu_config);
+	struct evmm_percpu_config *cpu_conf = this_cpu_ptr(&percpu_config);
 
 	if (cpu_conf->vmxon) {
 		vmxoff();
@@ -293,13 +255,8 @@ static void evmm_per_cpu_exit(void *info)
 	if (cpu_conf->vmxon_region) {
 		free_page((unsigned long)cpu_conf->vmxon_region);
 		cpu_conf->vmxon_region = NULL;
+		cpu_conf->vmxon_region_phys = 0;
 		pr_debug("evmm: CPU #%d: 'vmxon_region' freed.\n", cpu_id);
-	}
-
-	if (cpu_conf->vmcs_region) {
-		free_page((unsigned long)cpu_conf->vmcs_region);
-		cpu_conf->vmcs_region = NULL;
-		pr_debug("evmm: CPU #%d: 'vmcs_region' freed.\n", cpu_id);
 	}
 
 	if (cpu_conf->cr_saved) {
@@ -311,6 +268,8 @@ static void evmm_per_cpu_exit(void *info)
 			 "values.\n",
 			 cpu_id);
 	}
+
+	// TODO: cleanup all allocated vcpu structures
 
 	pr_debug("evmm: CPU #%d: cleanup done.\n", cpu_id);
 }
@@ -362,7 +321,3 @@ static void __exit evmm_exit(void)
 
 module_init(evmm_init);
 module_exit(evmm_exit);
-
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("MJ Pooladkhay <mj@pooladkhay.com>");
-MODULE_DESCRIPTION("An experimental Virtual Machine Monitor");
