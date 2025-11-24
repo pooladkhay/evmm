@@ -6,7 +6,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#include "../evmm.h"
+#include "../include/uapi/evmm.h"
 
 int main(void)
 {
@@ -31,17 +31,28 @@ int main(void)
 
 	printf("ioctl returned: %d\n", ret);
 	printf("evmm api version: %d\n", evmm_api_version);
+	printf("\n\n");
 
-	// this should fail with -ENOTTY
-	ret = ioctl(evmm_fd, 0, NULL);
-	if (ret >= 0) {
-		fprintf(stderr, "ioctl shouldn've succeeded: %s\n",
-			strerror(errno));
+	int val = 0;
+	ret = ioctl(evmm_fd, EVMM_VCPU_CREATE, &val);
+	if (ret < 0) {
+		fprintf(stderr, "ioctl failed: %s\n", strerror(errno));
 		close(evmm_fd);
 		exit(EXIT_FAILURE);
 	}
 
-	printf("ioctl returned: %s, which was expected.\n", strerror(errno));
+	printf("ioctl returned: %d\n", ret);
+	printf("val: %d\n", val);
+	// this should fail with -ENOTTY
+	// ret = ioctl(evmm_fd, 0, NULL);
+	// if (ret >= 0) {
+	// 	fprintf(stderr, "ioctl shouldn've succeeded: %s\n",
+	// 		strerror(errno));
+	// 	close(evmm_fd);
+	// 	exit(EXIT_FAILURE);
+	// }
+
+	// printf("ioctl returned: %s, which was expected.\n", strerror(errno));
 
 	if (close(evmm_fd) < 0) {
 		fprintf(stderr, "failed to close device: %s\n",

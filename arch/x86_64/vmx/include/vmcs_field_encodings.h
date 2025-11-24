@@ -1,6 +1,6 @@
 
-#ifndef _EVMM_ARCH_X86_64_VMX_VMCS_FIELD_ENCODINGS_H_
-#define _EVMM_ARCH_X86_64_VMX_VMCS_FIELD_ENCODINGS_H_
+#ifndef EVMM_ARCH_X86_64_VMX_VMCS_FIELD_ENCODINGS_H
+#define EVMM_ARCH_X86_64_VMX_VMCS_FIELD_ENCODINGS_H
 
 #include <linux/types.h>
 
@@ -26,7 +26,8 @@ enum vmm_vmcs_encoding_width {
 	natural,
 };
 
-// Bit 12 (reserved) and bits 31:15 must be cleared, hence ( ... & 0x00006FFF ).
+/* Bit 12 (reserved) and bits 31:15 must be cleared, hence ( ... & 0x00006FFF ).
+ */
 #define VMCS_ENCODE_COMPONENT(access_type, index, type, width)                 \
 	(__u32)(((((access_type) & 0x1)) | (((index) & 0x1FF) << 1) |          \
 		 (((type) & 0x3) << 10) | (((width) & 0x3) << 13)) &           \
@@ -151,7 +152,7 @@ enum evmm_vmcs_guest_encodings {
 	GUEST_TR_SELECTOR = VMCS_ENCODE_COMPONENT_FULL_16(7, guest_state),
 	GUEST_INTERRUPT_STATUS_COND =
 	    VMCS_ENCODE_COMPONENT_FULL_16(8, guest_state),
-	PML_INDEX_COND = VMCS_ENCODE_COMPONENT_FULL_16(9, guest_state),
+	GUEST_PML_INDEX_COND = VMCS_ENCODE_COMPONENT_FULL_16(9, guest_state),
 	GUEST_UINV_COND = VMCS_ENCODE_COMPONENT_FULL_16(10, guest_state),
 };
 
@@ -283,7 +284,7 @@ enum evmm_vmcs_control_encodings {
 	    VMCS_ENCODE_COMPONENT_FULL_64(25, control),
 	CONTROL_TERTIARY_PROCESSOR_BASED_VM_EXECUTION_CONTROLS_COND =
 	    VMCS_ENCODE_COMPONENT_FULL_64(26, control),
-	// index 27 missing
+	/* index 27 missing */
 	CONTROL_LOW_PASID_DIRECTORY_ADDRESS_COND =
 	    VMCS_ENCODE_COMPONENT_FULL_64(28, control),
 	CONTROL_HIGH_PASID_DIRECTORY_ADDRESS_COND =
@@ -298,7 +299,7 @@ enum evmm_vmcs_control_encodings {
 	    VMCS_ENCODE_COMPONENT_FULL_64(33, control),
 	CONTROL_SECONDARY_VM_EXIT_CONTROLS_COND =
 	    VMCS_ENCODE_COMPONENT_FULL_64(34, control),
-	// index 35, 36 missing
+	/* index 35, 36 missing */
 	CONTROL_IA32_SPEC_CTRL_MASK_COND =
 	    VMCS_ENCODE_COMPONENT_FULL_64(37, control),
 	CONTROL_IA32_SPEC_CTRL_SHADOW_COND =
@@ -396,4 +397,4 @@ enum evmm_vmcs_vmexit_info_encodings {
 
 };
 
-#endif /* _EVMM_ARCH_X86_64_VMX_VMCS_FIELD_ENCODINGS_H_ */
+#endif /* EVMM_ARCH_X86_64_VMX_VMCS_FIELD_ENCODINGS_H */
