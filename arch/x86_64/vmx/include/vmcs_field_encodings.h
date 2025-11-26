@@ -4,6 +4,58 @@
 
 #include <linux/types.h>
 
+struct evmm_vmcs {
+	union {
+		__u32 full;
+		struct {
+			__u32 revision_identifier : 31;
+			__u32 shadow_vmcs_indicator : 1;
+		} bits;
+	} header;
+
+	__u32 abort_indicator;
+	char data[];
+} __packed;
+
+union evmm_vmcs_vmexit_reason {
+	__u32 full;
+	struct {
+		__u32 basic : 16;
+		__u32 always_0 : 1;
+		__u32 not_defined_1 : 8;
+		__u32 premature_shadow_stack_busy : 1;
+		__u32 bus_lock_assertion : 1;
+		__u32 incident_to_enclave_mode : 1;
+		__u32 pending_mtf : 1;
+		__u32 from_vmx_root : 1;
+		__u32 not_defined_2 : 1;
+		__u32 vm_entry_failure : 1;
+	} fields;
+} __packed;
+
+union evmm_vmcs_vmexit_intr_info {
+	__u32 full;
+	struct {
+		__u32 vector : 8;
+		__u32 type : 3;
+		__u32 err_code_valid : 1;
+		__u32 iret_unblocking_nmi : 1;
+		__u32 not_defined : 18;
+		__u32 valid : 1;
+	} fields;
+} __packed;
+
+enum evmm_vmcs_intr_info_type {
+	INTR_TYPE_EXTERNAL_INTERRUPT = 0,
+	INTR_TYPE_RESERVED_1 = 1,
+	INTR_TYPE_NMI = 2,
+	INTR_TYPE_HW_EXCEPTION = 3,
+	INTR_TYPE_RESERVED_2 = 4,
+	INTR_TYPE_PRIV_SW_EXCEPTION = 5,
+	INTR_TYPE_SW_EXCEPTION = 6,
+	INTR_TYPE_RESERVED_3 = 7,
+};
+
 /*
  * Field Encoding-related structures and macros,
  * as defined in Intel SDM, 3C - Table 26-21

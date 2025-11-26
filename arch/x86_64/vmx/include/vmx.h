@@ -10,20 +10,9 @@
 #include "msr.h"
 #include "vmcs_field_encodings.h"
 
+#define EVMM_EXIT_REASON_EXCEPTION_OR_NMI 0
+#define EVMM_EXIT_REASON_EXT_INTR 1
 #define EVMM_EXIT_REASON_HLT 12
-
-struct evmm_vmcs {
-	union {
-		__u32 full;
-		struct {
-			__u32 revision_identifier : 31;
-			__u32 shadow_vmcs_indicator : 1;
-		} bits;
-	} header;
-
-	__u32 abort_indicator;
-	char data[];
-} __packed;
 
 struct evmm_vmxon_region {
 	union {
