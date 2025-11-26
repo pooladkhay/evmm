@@ -1,5 +1,7 @@
-#define DEBUG
+// #define DEBUG
 #include "asm/msr-index.h"
+#include "linux/irqflags.h"
+#include "linux/stddef.h"
 #include "linux/types.h"
 #include <asm/io.h>
 #include <asm/msr.h>
@@ -45,42 +47,103 @@ static DEFINE_PER_CPU(struct evmm_percpu_config, percpu_config) = {
 static void temp_guest_entrypoint(void)
 {
 	pr_alert("evmm: THIS IS FROM GUEST!");
+	for (unsigned long i = 0; i <= 10000000000; i++)
+		if (i % 100000000 == 0)
+			pr_warn("%lum\n", i / 100000000);
 	asm volatile("hlt");
 }
 
-static void evmm_exit_handler(void)
+static int evmm_exit_handler(struct evmm_vcpu *vcpu)
 {
-	pr_info("evmm: exit handler called\n");
+	pr_debug("evmm: exit handler called\n");
 
-	__u32 exit_reason = vmreadz(VMEXIT_INFO_EXIT_REASON);
-	pr_info("evmm: exit reason: %d (0x%x)\n", exit_reason, exit_reason);
-	__u16 basic_exit_reason = exit_reason & 0xFFFF;
-	pr_info("evmm: basic exit reason: %d (0x%x)\n", basic_exit_reason,
-		basic_exit_reason);
+	union evmm_vmcs_vmexit_reason exit_reason;
+	exit_reason.full = (u32)vmreadz(VMEXIT_INFO_EXIT_REASON);
 
-	// Check if this is a VM-entry failure
-	if (exit_reason & 0x80000000) {
+	if (exit_reason.fields.vm_entry_failure) {
 		pr_err("evmm: VM-entry failure detected!\n");
-		__u32 error = vmreadz(VMEXIT_INFO_VM_INSTRUCTION_ERROR);
-		pr_err("evmm: VM-instruction error number: %u\n", error);
-		__u64 qualification = vmreadz(VMEXIT_INFO_EXIT_QUALIFICATION);
-		pr_err("evmm: Exit qualification: 0x%llx\n", qualification);
-		return;
+		pr_err("evmm: basic exit reason: %d\n",
+		       exit_reason.fields.basic);
+		vcpu->launched = 0;
+		return 1;
 	}
 
-	switch (basic_exit_reason) {
+	u32 vmexit_instruction_length =
+	    (u32)vmreadz(VMEXIT_INFO_VM_EXIT_INSTRUCTION_LENGTH);
+
+	switch (exit_reason.fields.basic) {
+	case EVMM_EXIT_REASON_EXCEPTION_OR_NMI:
+		pr_err("evmm: exit due to NMI or EXCEPTION - aborting...\n");
+		return 1;
+		// break;
+	case EVMM_EXIT_REASON_EXT_INTR:
+		pr_debug("evmm: exit due to external interrupt\n");
+
+		pr_debug("evmm: calling linux interrupt handler...\n");
+
+		local_irq_enable();
+
+		pr_debug("evmm: linux interrupt handler returned.\n");
+
+		// cond_resched();
+
+		if (signal_pending(current)) {
+			pr_info("evmm: signal pending, exiting VMM loop\n");
+			local_irq_disable();
+			return 1; // Stop the loop and return to userspace
+		}
+
+		local_irq_disable();
+
+		pr_debug("evmm: resuming...\n");
+
+		// union evmm_vmcs_vmexit_intr_info intr_info;
+		// intr_info.full =
+		//     (u32)vmreadz(VMEXIT_INFO_VM_EXIT_INTERRUPTION_INFORMATION);
+
+		/*
+		 * Only valid if exit_ctls.bits.ack_interrupt_on_exit = 1
+		 * This would mean that we don't want linux kernel to handle
+		 * interrupts
+		 */
+		// if (intr_info.fields.valid) {
+		// 	switch (intr_info.fields.type) {
+		// 	case INTR_TYPE_EXTERNAL_INTERRUPT:
+		// 		pr_info("evmm: interrupt type: external "
+		// 			"interrupt\n");
+		// 		break;
+		// 	case INTR_TYPE_NMI:
+		// 		pr_info("evmm: interrupt type: NMI\n");
+		// 		break;
+		// 	case INTR_TYPE_HW_EXCEPTION:
+		// 		pr_info("evmm: interrupt type: hardware "
+		// 			"exception\n");
+		// 		break;
+		// 	case INTR_TYPE_PRIV_SW_EXCEPTION:
+		// 		pr_info("evmm: interrupt type: privileged "
+		// 			"software exception\n");
+		// 		break;
+		// 	case INTR_TYPE_SW_EXCEPTION:
+		// 		pr_info("evmm: interrupt type: software "
+		// 			"exception\n");
+		// 		break;
+		// 	default:
+		// 		pr_info("evmm: interrupt type: undefined\n");
+		// 		break;
+		// 	}
+		// } else {
+		// }
+		return 0;
 	case EVMM_EXIT_REASON_HLT:
 		pr_info("evmm: guest executed 'hlt' instruction\n");
-		break;
+		pr_info("evmm: exit instruction length: %d\n",
+			vmexit_instruction_length);
+		return 1;
 	default:
-		pr_err("evmm: unhandled exit reason: %d (0x%x)\n", exit_reason,
-		       exit_reason);
-		pr_info("evmm: basic exit reason: %d (0x%x)\n",
-			basic_exit_reason, basic_exit_reason);
-		break;
+		pr_err("evmm: unhandled exit reason: %d - aborting...\n",
+		       exit_reason.fields.basic);
+		return 1;
 	}
-
-	return;
 }
 
 static void evmm_init_guest_state(void *guest_rip, void *guest_rsp)
@@ -221,6 +284,8 @@ static void evmm_init_control_state(phys_addr_t msr_bitmap_phys_addr,
 
 	union ia32_vmx_pinbased_ctls_msr pinbased_ctls;
 	pinbased_ctls.full = 0;
+	pinbased_ctls.bits.external_interrupt_exiting = 1;
+	pinbased_ctls.bits.nmi_exiting = 1;
 	__u32 pinbased_ctls_adjusted = evmm_adjust_control_field(
 	    basic_msr.bits.true_controls ? MSR_IA32_VMX_TRUE_PINBASED_CTLS
 					 : MSR_IA32_VMX_PINBASED_CTLS,
@@ -714,20 +779,37 @@ static long evmm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 			       temp_guest_entrypoint);
 
 		int ret = __vmx_vcpu_run(vcpu);
+		pr_debug("evmm: VMLAUNCH: '__vmx_vcpu_run' ret: %d", ret);
+		if (!ret) {
+			for (;;) {
+				ret = evmm_exit_handler(vcpu);
+				if (ret) {
+					pr_warn(
+					    "evmm: exit handler returned: %d - "
+					    "aborting...\n",
+					    ret);
+					ret = 0;
+					goto out;
+				} else {
+					ret = __vmx_vcpu_run(vcpu);
+					pr_debug("evmm: VMRESUME: "
+						 "'__vmx_vcpu_run' ret: %d",
+						 ret);
+					if (ret)
+						goto out;
+				}
+			}
+		}
 
-		pr_debug("evmm: '__vmx_vcpu_run' ret: %d", ret);
-
+	out:
 		if (ret) {
+			// TODO: move to exit handler
 			unsigned long error =
 			    vmreadz(VMEXIT_INFO_VM_INSTRUCTION_ERROR);
 			pr_err("evmm: VMLAUNCH failed! Error code: %d. "
 			       "Instruction "
 			       "Error: %lu\n",
 			       ret, error);
-		} else {
-			// TODO: this is just for testing
-			pr_debug("evmm: vmlaunch was successfull.\n");
-			evmm_exit_handler();
 		}
 
 		evmm_vcpu_destroy(vcpu);

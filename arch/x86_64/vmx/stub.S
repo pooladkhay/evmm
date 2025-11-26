@@ -1,43 +1,5 @@
 #include <linux/linkage.h>
 
-/* not used yet */
-.macro SAVE_GPRS
-    push    %rax
-    push    %rcx
-    push    %rdx
-    push    %rbx
-    push    %rbp
-    push    %rsi
-    push    %rdi
-    push    %r8
-    push    %r9
-    push    %r10
-    push    %r11
-    push    %r12
-    push    %r13
-    push    %r14
-    push    %r15
-.endm
-
-/* not used yet */
-.macro RESTORE_GRPS
-    pop     %r15
-    pop     %r14
-    pop     %r13
-    pop     %r12
-    pop     %r11
-    pop     %r10
-    pop     %r9
-    pop     %r8
-    pop     %rdi
-    pop     %rsi
-    pop     %rbp
-    pop     %rbx
-    pop     %rdx
-    pop     %rcx
-    pop     %rax
-.endm
-
 /*
  * Offsets into struct evmm_vcpu
  * Defined in 'arch/x86_64/vmx/vmx.h'
@@ -51,37 +13,61 @@
  *   void *orig_host_rsp;                // offset 40
  *   void *host_stack;                   // offset 48
  *	 void *host_rsp;	                 // offset 56
- *   struct { ... } gprs;                // offset 64
+ *	 u64 launched;                       // offset 64
+ *   struct {
+ *       __u64 rax, rcx, rdx, rbx;
+ * 		 __u64 rbp, rsi, rdi;            // rsp is ignored
+ * 		 __u64 r8, r9, r10, r11;
+ * 		 __u64 r12, r13, r14, r15;
+ *   } gprs;                             // offset 72
  * };
  */
 
 #define VCPU_VMCS_PHYS_ADDR 16
 #define VCPU_ORIG_HOST_RSP  40
 #define VCPU_HOST_RSP       56
-#define VCPU_GPRS_OFFSET    64
+#define VCPU_LAUNCHED       64
+#define VCPU_GPRS_OFFSET    72
 
 /*
  * Offsets into struct evmm_vcpu.gprs
  * This reflects the order in which registers are defined
  */
-#define GPRS_RAX    0
-#define GPRS_RCX    8
-#define GPRS_RDX    16
-#define GPRS_RBX    24
-#define GPRS_RSP    32
-#define GPRS_RBP    40
-#define GPRS_RSI    48
-#define GPRS_RDI    56
-#define GPRS_R8     64
-#define GPRS_R9     72
-#define GPRS_R10    80
-#define GPRS_R11    88
-#define GPRS_R12    96
-#define GPRS_R13    104
-#define GPRS_R14    112
-#define GPRS_R15    120
+#define GPRS_RAX    (0 + VCPU_GPRS_OFFSET)
+#define GPRS_RCX    (8 + VCPU_GPRS_OFFSET)
+#define GPRS_RDX    (16 + VCPU_GPRS_OFFSET)
+#define GPRS_RBX    (24 + VCPU_GPRS_OFFSET)
+#define GPRS_RBP    (32 + VCPU_GPRS_OFFSET)
+#define GPRS_RSI    (40 + VCPU_GPRS_OFFSET)
+#define GPRS_RDI    (48 + VCPU_GPRS_OFFSET)
+#define GPRS_R8     (56 + VCPU_GPRS_OFFSET)
+#define GPRS_R9     (64 + VCPU_GPRS_OFFSET)
+#define GPRS_R10    (72 + VCPU_GPRS_OFFSET)
+#define GPRS_R11    (80 + VCPU_GPRS_OFFSET)
+#define GPRS_R12    (88 + VCPU_GPRS_OFFSET)
+#define GPRS_R13    (96 + VCPU_GPRS_OFFSET)
+#define GPRS_R14    (104 + VCPU_GPRS_OFFSET)
+#define GPRS_R15    (112 + VCPU_GPRS_OFFSET)
 
 #define VMCS_HOST_RSP 0x00006c14
+
+.macro RESTORE_GUEST_GPRS
+    movq    GPRS_RAX(%rdi), %rax
+    movq    GPRS_RCX(%rdi), %rcx
+    movq    GPRS_RDX(%rdi), %rdx
+    movq    GPRS_RBX(%rdi), %rbx
+    movq    GPRS_RBP(%rdi), %rbp
+    movq    GPRS_R8(%rdi), %r8
+    movq    GPRS_R9(%rdi), %r9
+    movq    GPRS_R10(%rdi), %r10
+    movq    GPRS_R11(%rdi), %r11
+    movq    GPRS_R12(%rdi), %r12
+    movq    GPRS_R13(%rdi), %r13
+    movq    GPRS_R14(%rdi), %r14
+    movq    GPRS_R15(%rdi), %r15
+    movq    GPRS_RSI(%rdi), %rsi
+    movq    GPRS_RDI(%rdi), %rdi
+.endm
 
 .section .text
 
@@ -90,61 +76,82 @@
  * 'struct evmm_vcpu *vcpu' is available in %rdi (first arg)
  */
 SYM_FUNC_START(__vmx_vcpu_run)
-    push    %rbp            /* callee saved */
-    mov     %rsp, %rbp      /* creating a new frame */
+    pushq    %rbp            /* callee saved */
+    movq     %rsp, %rbp      /* creating a new frame */
 
     /* save callee-saved registers */
-    push    %rbx
-    push    %r12
-    push    %r13
-    push    %r14
-    push    %r15
+    pushq    %rbx
+    pushq    %r12
+    pushq    %r13
+    pushq    %r14
+    pushq    %r15
 
-    mov     %rsp, VCPU_ORIG_HOST_RSP(%rdi)      /* save %rsp to pcpu->orig_host_rsp */
+    movq     %rsp, VCPU_ORIG_HOST_RSP(%rdi)      /* save %rsp to vcpu.orig_host_rsp */
 
-    /* TODO: investigate using scratch registers in VMCS */
+    /*
+     * will be used in entry_failed path.
+     * since %rsp is already saved, we
+     * never need to pop this upon restore.
+     */
+    pushq   %rdi
 
     /* write vcpu* at the top of host_stack */
-    mov     VCPU_HOST_RSP(%rdi), %rax
-    sub     $8, %rax
-    mov     %rdi, (%rax)
-    mov     %rax, VCPU_HOST_RSP(%rdi)
+    movq     VCPU_HOST_RSP(%rdi), %rax
+    subq     $8, %rax
+    movq     %rdi, (%rax)
+    movq     %rax, VCPU_HOST_RSP(%rdi)
 
-    mov     $VMCS_HOST_RSP, %rdx
-    vmwrite %rax, %rdx
+    /* update HOST_RSP in VMCS */
+    movq     $VMCS_HOST_RSP, %rdx
+    vmwrite  %rax, %rdx
+
+    movq    VCPU_LAUNCHED(%rdi), %rax
+    testq   %rax, %rax
+    jnz    resume_path
+
+    RESTORE_GUEST_GPRS
 
     vmlaunch
 
-    /* VMLAUNCH failed */
+    jmp     entry_failed
+
+resume_path:
+    RESTORE_GUEST_GPRS
+    vmresume
+
+entry_failed:
+    /* VMLAUNCH/VMRESUME failed */
+
+    popq %rdi
 
     /* calculate error code:
      * %rax = 1 (assume ZF set / VMfailValid)
      * %rcx = 2 (value for CF set / VMfailInvalid)
      * if CF=1, move %rcx into %rax.
      */
-    mov     $1, %rax            /* default to error 1 (ZF set) */
-    mov     $2, %rcx            /* prepare error 2 (CF set) */
-    cmovc   %rcx, %rax          /* if CF=1, %rax becomes 2 */
-    push    %rax                /* save the calculated error code to the stack */
+    movq     $1, %rax            /* default to error 1 (ZF set) */
+    movq     $2, %rcx            /* prepare error 2 (CF set) */
+    cmovcq   %rcx, %rax          /* if CF=1, %rax becomes 2 */
+    pushq    %rax                /* save the calculated error code to the stack */
 
     /* set vcpu.orig_host_rsp = NULL */
-    xor     %rax, %rax
-    mov     %rax, VCPU_ORIG_HOST_RSP(%rdi)
+    xorl     %eax, %eax
+    movq     %rax, VCPU_ORIG_HOST_RSP(%rdi)
 
     /* remove vcpu from top of host_stack */
-    mov     VCPU_HOST_RSP(%rdi), %rax
-    add     $8, %rax
-    mov     %rax, VCPU_HOST_RSP(%rdi)
+    movq     VCPU_HOST_RSP(%rdi), %rax
+    addq     $8, %rax
+    movq     %rax, VCPU_HOST_RSP(%rdi)
 
-    pop     %rax /* return value from vmlaunch */
+    popq     %rax /* return value from vmlaunch/vmresume */
 
     /* restore callee-saved registers */
-    pop     %r15
-    pop     %r14
-    pop     %r13
-    pop     %r12
-    pop     %rbx
-    pop     %rbp
+    popq     %r15
+    popq     %r14
+    popq     %r13
+    popq     %r12
+    popq     %rbx
+    popq     %rbp
 
     RET
 SYM_FUNC_END(__vmx_vcpu_run)
@@ -161,19 +168,54 @@ SYM_CODE_START(__vmx_host_entrypoint)
      */
     ENDBR
 
-    pop     %rdi                            /* %rdi now contains vcpu* */
-    mov     VCPU_ORIG_HOST_RSP(%rdi), %rsp  /* restore the original stack that would return us to the ioctl call */
+    /* save guest rdi on the stack */
+    pushq    %rdi
+    /* %rdi now contains vcpu* */
+    movq     8(%rsp), %rdi
+
+    /* save all guest GPRs to vcpu struct, except for rdi */
+    movq    %rax, GPRS_RAX(%rdi)
+    movq    %rcx, GPRS_RCX(%rdi)
+    movq    %rdx, GPRS_RDX(%rdi)
+    movq    %rbx, GPRS_RBX(%rdi)
+    movq    %rbp, GPRS_RBP(%rdi)
+    movq    %rsi, GPRS_RSI(%rdi)
+    movq    %r8, GPRS_R8(%rdi)
+    movq    %r9, GPRS_R9(%rdi)
+    movq    %r10, GPRS_R10(%rdi)
+    movq    %r11, GPRS_R11(%rdi)
+    movq    %r12, GPRS_R12(%rdi)
+    movq    %r13, GPRS_R13(%rdi)
+    movq    %r14, GPRS_R14(%rdi)
+    movq    %r15, GPRS_R15(%rdi)
+
+    /* mark vcpu as launched */
+    movq    $1, VCPU_LAUNCHED(%rdi)
+
+    /* save the original stack that would return us to the ioctl call, to rcx */
+    movq    VCPU_ORIG_HOST_RSP(%rdi), %rcx
+
+    /* save guest rdi to vmcs */
+    popq    %rax
+    movq    %rax, GPRS_RDI(%rdi)
+
+    /* after this, vcpu->host_stack is clear, i.e. does not contain any values. next launch/resume will populate it again */
+    addq    $8, %rsp
+    movq    %rsp, VCPU_HOST_RSP(%rdi)
+
+    /* restore the original stack that would return us to the ioctl call */
+    movq    %rcx, %rsp
 
     /* restore callee-saved registers */
-    pop     %r15
-    pop     %r14
-    pop     %r13
-    pop     %r12
-    pop     %rbx
-    pop     %rbp
+    popq    %r15
+    popq    %r14
+    popq    %r13
+    popq    %r12
+    popq    %rbx
+    popq    %rbp
 
     /* return 0 from from '__vmx_vcpu_run' */
-    xor %rax, %rax
+    xorl    %eax, %eax
 
     RET
 SYM_CODE_END(__vmx_host_entrypoint)

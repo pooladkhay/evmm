@@ -34,6 +34,7 @@ struct evmm_vcpu {
 	void *orig_host_rsp; // the kernel stack that has initiated a vm run
 	void *host_stack;    // base address of stack
 	void *host_rsp;	     // rsp to be used for passing vcpu*
+	u64 launched;
 	struct {
 		__u64 rax, rcx, rdx, rbx;
 		__u64 rsp, rbp, rsi, rdi;
