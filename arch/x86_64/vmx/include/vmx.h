@@ -8,7 +8,7 @@
 #include <linux/types.h>
 
 #include "msr.h"
-#include "vmcs_field_encodings.h"
+#include "vmcs.h"
 
 #define EVMM_EXIT_REASON_EXCEPTION_OR_NMI 0
 #define EVMM_EXIT_REASON_EXT_INTR 1
