@@ -13,7 +13,8 @@
  *   void *orig_host_rsp;                // offset 40
  *   void *host_stack;                   // offset 48
  *	 void *host_rsp;	                 // offset 56
- *	 u64 launched;                       // offset 64
+ *	 u32 launched;                       // offset 64
+ *	 u32 last_core_id;
  *   struct {
  *       __u64 rax, rcx, rdx, rbx;
  * 		 __u64 rbp, rsi, rdi;            // rsp is ignored
@@ -88,6 +89,12 @@ SYM_FUNC_START(__vmx_vcpu_run)
 
     movq     %rsp, VCPU_ORIG_HOST_RSP(%rdi)      /* save %rsp to vcpu.orig_host_rsp */
 
+    /* write vcpu* at the top of host_stack */
+    movq     VCPU_ORIG_HOST_RSP(%rdi), %rax
+    subq     $8, %rax
+    movq     %rdi, (%rax)
+    movq     %rax, VCPU_ORIG_HOST_RSP(%rdi)
+
     /*
      * will be used in entry_failed path.
      * since %rsp is already saved, we
@@ -95,18 +102,12 @@ SYM_FUNC_START(__vmx_vcpu_run)
      */
     pushq   %rdi
 
-    /* write vcpu* at the top of host_stack */
-    movq     VCPU_HOST_RSP(%rdi), %rax
-    subq     $8, %rax
-    movq     %rdi, (%rax)
-    movq     %rax, VCPU_HOST_RSP(%rdi)
-
-    /* update HOST_RSP in VMCS */
+    /* update HOST_RSP in VMCS with VCPU_ORIG_HOST_RSP */
     movq     $VMCS_HOST_RSP, %rdx
     vmwrite  %rax, %rdx
 
-    movq    VCPU_LAUNCHED(%rdi), %rax
-    testq   %rax, %rax
+    movl    VCPU_LAUNCHED(%rdi), %eax
+    testl   %eax, %eax
     jnz    resume_path
 
     RESTORE_GUEST_GPRS
@@ -124,6 +125,11 @@ entry_failed:
 
     popq %rdi
 
+    /* remove vcpu from top of VCPU_ORIG_HOST_RSP */
+    movq     VCPU_ORIG_HOST_RSP(%rdi), %rax
+    addq     $8, %rax
+    movq     %rax, VCPU_ORIG_HOST_RSP(%rdi)
+
     /* calculate error code:
      * %rax = 1 (assume ZF set / VMfailValid)
      * %rcx = 2 (value for CF set / VMfailInvalid)
@@ -137,11 +143,6 @@ entry_failed:
     /* set vcpu.orig_host_rsp = NULL */
     xorl     %eax, %eax
     movq     %rax, VCPU_ORIG_HOST_RSP(%rdi)
-
-    /* remove vcpu from top of host_stack */
-    movq     VCPU_HOST_RSP(%rdi), %rax
-    addq     $8, %rax
-    movq     %rax, VCPU_HOST_RSP(%rdi)
 
     popq     %rax /* return value from vmlaunch/vmresume */
 
@@ -190,10 +191,10 @@ SYM_CODE_START(__vmx_host_entrypoint)
     movq    %r15, GPRS_R15(%rdi)
 
     /* mark vcpu as launched */
-    movq    $1, VCPU_LAUNCHED(%rdi)
+    movl    $1, VCPU_LAUNCHED(%rdi)
 
     /* save the original stack that would return us to the ioctl call, to rcx */
-    movq    VCPU_ORIG_HOST_RSP(%rdi), %rcx
+    /* movq    VCPU_ORIG_HOST_RSP(%rdi), %rcx  */
 
     /* save guest rdi to vmcs */
     popq    %rax
@@ -201,10 +202,10 @@ SYM_CODE_START(__vmx_host_entrypoint)
 
     /* after this, vcpu->host_stack is clear, i.e. does not contain any values. next launch/resume will populate it again */
     addq    $8, %rsp
-    movq    %rsp, VCPU_HOST_RSP(%rdi)
+    movq    %rsp, VCPU_ORIG_HOST_RSP(%rdi)
 
     /* restore the original stack that would return us to the ioctl call */
-    movq    %rcx, %rsp
+    /*movq    %rcx, %rsp  */
 
     /* restore callee-saved registers */
     popq    %r15

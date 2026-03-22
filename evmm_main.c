@@ -1,11 +1,6 @@
 // #define DEBUG
-#include "asm/msr-index.h"
-#include "linux/irqflags.h"
-#include "linux/stddef.h"
-#include "linux/types.h"
 #include <asm/io.h>
-#include <asm/msr.h>
-#include <asm/processor-flags.h>
+#include <asm/mmu_context.h>
 #include <linux/atomic.h>
 #include <linux/cpufeature.h>
 #include <linux/fs.h>
@@ -20,10 +15,20 @@
 #include <linux/printk.h>
 #include <linux/processor.h>
 #include <linux/smp.h>
+#include <linux/types.h>
 #include <linux/uaccess.h>
 
+#include "arch/x86_64/vmx/include/vmcs.h"
 #include "arch/x86_64/vmx/include/vmx.h"
 #include "include/uapi/evmm.h"
+
+/*
+ * IMPORTANT:
+ *
+ * Although this is 'evmm_main.c', and outside of arch directory but it
+ * still contains architecture specific code hence refactor is required.
+ * (TODO)
+ */
 
 MODULE_AUTHOR("MJ Pooladkhay <mj@pooladkhay.com>");
 MODULE_DESCRIPTION("An experimental Virtual Machine Monitor");
@@ -31,8 +36,7 @@ MODULE_LICENSE("GPL");
 
 #define EVMM_API_VERSION 1
 
-#define HOST_STACK_SIZE PAGE_SIZE * 6
-#define GUEST_STACK_SIZE PAGE_SIZE * 6
+#define GUEST_STACK_SIZE PAGE_SIZE
 
 // TODO: investigate using an array indexed by core id
 static DEFINE_PER_CPU(struct evmm_percpu_config, percpu_config) = {
@@ -44,12 +48,30 @@ static DEFINE_PER_CPU(struct evmm_percpu_config, percpu_config) = {
     .cr_saved = false,
 };
 
+static __read_mostly struct preempt_ops evmm_preempt_ops;
+
+static void guest_print(unsigned long value)
+{
+	/* * VMCALL instruction.
+	 * We pass a "Hypercall ID" in RAX (e.g., 0x1)
+	 * and the value to print in RBX.
+	 */
+	asm volatile("mov $1, %%rax \n\t"
+		     "mov %0, %%rbx \n\t"
+		     "vmcall"
+		     :
+		     : "r"(value)
+		     : "rax", "rbx", "memory");
+}
+
 static void temp_guest_entrypoint(void)
 {
-	pr_alert("evmm: THIS IS FROM GUEST!");
-	for (unsigned long i = 0; i <= 10000000000; i++)
-		if (i % 100000000 == 0)
-			pr_warn("%lum\n", i / 100000000);
+	for (unsigned long i = 0; i <= 100000000000; i++) {
+		if (i % 100000000 == 0) {
+			guest_print(i / 100000000);
+			asm volatile("pause");
+		}
+	}
 	asm volatile("hlt");
 }
 
@@ -57,57 +79,39 @@ static int evmm_exit_handler(struct evmm_vcpu *vcpu)
 {
 	pr_debug("evmm: exit handler called\n");
 
-	union evmm_vmcs_vmexit_reason exit_reason;
-	exit_reason.full = (u32)vmreadz(VMEXIT_INFO_EXIT_REASON);
-
-	if (exit_reason.fields.vm_entry_failure) {
+	if (vcpu->exit_info.exit_reason.fields.vm_entry_failure) {
 		pr_err("evmm: VM-entry failure detected!\n");
 		pr_err("evmm: basic exit reason: %d\n",
-		       exit_reason.fields.basic);
+		       vcpu->exit_info.exit_reason.fields.basic);
 		vcpu->launched = 0;
 		return 1;
 	}
 
-	u32 vmexit_instruction_length =
-	    (u32)vmreadz(VMEXIT_INFO_VM_EXIT_INSTRUCTION_LENGTH);
-
-	switch (exit_reason.fields.basic) {
+	switch (vcpu->exit_info.exit_reason.fields.basic) {
 	case EVMM_EXIT_REASON_EXCEPTION_OR_NMI:
-		pr_err("evmm: exit due to NMI or EXCEPTION - aborting...\n");
+		if (vcpu->exit_info.intr_info.fields.valid &&
+		    vcpu->exit_info.intr_info.fields.type == INTR_TYPE_NMI) {
+
+			pr_info("evmm: hardware NMI on CPU%d\n",
+				smp_processor_id());
+
+			pr_info("evmm: NMI exit, re-entering guest\n");
+
+			return 0;
+		}
+		pr_err("evmm: exit due to non-NMI exception - "
+		       "aborting...\n");
 		return 1;
-		// break;
 	case EVMM_EXIT_REASON_EXT_INTR:
 		pr_debug("evmm: exit due to external interrupt\n");
-
-		pr_debug("evmm: calling linux interrupt handler...\n");
-
-		local_irq_enable();
-
-		pr_debug("evmm: linux interrupt handler returned.\n");
-
-		// cond_resched();
-
-		if (signal_pending(current)) {
-			pr_info("evmm: signal pending, exiting VMM loop\n");
-			local_irq_disable();
-			return 1; // Stop the loop and return to userspace
-		}
-
-		local_irq_disable();
-
-		pr_debug("evmm: resuming...\n");
-
-		// union evmm_vmcs_vmexit_intr_info intr_info;
-		// intr_info.full =
-		//     (u32)vmreadz(VMEXIT_INFO_VM_EXIT_INTERRUPTION_INFORMATION);
 
 		/*
 		 * Only valid if exit_ctls.bits.ack_interrupt_on_exit = 1
 		 * This would mean that we don't want linux kernel to handle
 		 * interrupts
 		 */
-		// if (intr_info.fields.valid) {
-		// 	switch (intr_info.fields.type) {
+		// if (vcpu->exit_info.intr_info.fields.valid) {
+		// 	switch (vcpu->exit_info.intr_info.fields.type) {
 		// 	case INTR_TYPE_EXTERNAL_INTERRUPT:
 		// 		pr_info("evmm: interrupt type: external "
 		// 			"interrupt\n");
@@ -134,16 +138,57 @@ static int evmm_exit_handler(struct evmm_vcpu *vcpu)
 		// } else {
 		// }
 		return 0;
-	case EVMM_EXIT_REASON_HLT:
-		pr_info("evmm: guest executed 'hlt' instruction\n");
-		pr_info("evmm: exit instruction length: %d\n",
-			vmexit_instruction_length);
+	case EVMM_EXIT_REASON_INIT:
+		pr_emerg("evmm: received INIT signal on cpu #%d while guest "
+			 "was running.\n",
+			 smp_processor_id());
+
+		pr_emerg("evmm: last_core_id: %d\n", vcpu->last_core_id);
+		pr_emerg("evmm: GUEST_RIP: 0x%llx\n", vmreadz(GUEST_RIP));
+		pr_emerg("evmm: GUEST_RSP: 0x%llx\n", vmreadz(GUEST_RSP));
+		pr_emerg("evmm: GUEST_CR3: 0x%llx\n", vmreadz(GUEST_CR3));
+		pr_emerg("evmm: guest_rip (saved): 0x%llx\n", vcpu->guest_rip);
+		pr_emerg("evmm: guest_stack: %p (phys: 0x%llx)\n",
+			 vcpu->guest_stack, virt_to_phys(vcpu->guest_stack));
+
+		// Try to read IDT to see if guest has proper exception handlers
+		u64 guest_idtr_base = vmreadz(GUEST_IDTR_BASE);
+		u64 guest_idtr_limit = vmreadz(GUEST_IDTR_LIMIT);
+		pr_emerg("evmm: GUEST_IDTR: base=0x%llx limit=0x%llx\n",
+			 guest_idtr_base, guest_idtr_limit);
+
 		return 1;
+	case EVMM_EXIT_REASON_HLT:
+		pr_info("evmm: guest executed 'hlt'.\n");
+		return 1;
+	case EVMM_EXIT_REASON_VMCALL:
+		pr_debug("evmm: VMCALL handler\n");
+		if (vcpu->gprs.rax == 1) {
+			pr_info("%llu\n", vcpu->gprs.rbx);
+		}
+
+		vcpu->guest_rip += vcpu->exit_info.instruction_length;
+
+		return 0;
+	case EVMM_EXIT_REASON_VMX_PREEMPT_TIMER_EXPIRED:
+		pr_debug("evmm: vmx preempt timer expired.\n");
+		return 0;
 	default:
 		pr_err("evmm: unhandled exit reason: %d - aborting...\n",
-		       exit_reason.fields.basic);
+		       vcpu->exit_info.exit_reason.fields.basic);
 		return 1;
 	}
+}
+
+static void evmm_save_exit_info(struct evmm_vcpu *vcpu)
+{
+	vcpu->exit_info.exit_reason.full =
+	    (u32)vmreadz(VMEXIT_INFO_EXIT_REASON);
+	vcpu->exit_info.instruction_length =
+	    (u32)vmreadz(VMEXIT_INFO_VM_EXIT_INSTRUCTION_LENGTH);
+	vcpu->exit_info.intr_info.full =
+	    (u32)vmreadz(VMEXIT_INFO_VM_EXIT_INTERRUPTION_INFORMATION);
+	vcpu->guest_rip = vmreadz(GUEST_RIP);
 }
 
 static void evmm_init_guest_state(void *guest_rip, void *guest_rsp)
@@ -163,8 +208,8 @@ static void evmm_init_guest_state(void *guest_rip, void *guest_rsp)
 	vmwrite(GUEST_IA32_DEBUGCTL, 0);
 	vmwrite(GUEST_IA32_PAT_COND, vmreadz(HOST_IA32_PAT_COND));
 	vmwrite(GUEST_IA32_EFER_COND, vmreadz(HOST_IA32_EFER_COND));
-	// vmwrite(GUEST_IA32_PERF_GLOBAL_CTRL_COND,
-	// vmreadz(HOST_IA32_PERF_GLOBAL_CTRL_COND));
+	vmwrite(GUEST_IA32_PERF_GLOBAL_CTRL_COND,
+		vmreadz(HOST_IA32_PERF_GLOBAL_CTRL_COND));
 
 	vmwrite(GUEST_ES_LIMIT, -1);
 	vmwrite(GUEST_CS_LIMIT, -1);
@@ -190,7 +235,7 @@ static void evmm_init_guest_state(void *guest_rip, void *guest_rsp)
 	vmwrite(GUEST_TR_ACCESS_RIGHTS, 0x8b);
 	vmwrite(GUEST_INTERRUPTIBILITY_STATE, 0);
 	vmwrite(GUEST_ACTIVITY_STATE, 0);
-	// vmwrite(GUEST_IA32_SYSENTER_CS, vmreadz(HOST_IA32_SYSENTER_CS));
+	vmwrite(GUEST_IA32_SYSENTER_CS, vmreadz(HOST_IA32_SYSENTER_CS));
 	vmwrite(GUEST_VMX_PREEMPTION_TIMER_VALUE_COND, 0);
 
 	vmwrite(GUEST_CR0, vmreadz(HOST_CR0));
@@ -207,22 +252,26 @@ static void evmm_init_guest_state(void *guest_rip, void *guest_rsp)
 	vmwrite(GUEST_GDTR_BASE, vmreadz(HOST_GDTR_BASE));
 	vmwrite(GUEST_IDTR_BASE, vmreadz(HOST_IDTR_BASE));
 	vmwrite(GUEST_DR7, 0x400);
-	vmwrite(GUEST_RSP, (u64)guest_rsp);
-	vmwrite(GUEST_RIP, (u64)guest_rip);
+	if (guest_rsp)
+		vmwrite(GUEST_RSP, (u64)guest_rsp);
+	if (guest_rip)
+		vmwrite(GUEST_RIP, (u64)guest_rip);
 	vmwrite(GUEST_RFLAGS, 2);
 	vmwrite(GUEST_PENDING_DEBUG_EXCEPTION, 0);
-	// vmwrite(GUEST_IA32_SYSENTER_ESP, vmreadz(HOST_IA32_SYSENTER_ESP));
-	// vmwrite(GUEST_IA32_SYSENTER_EIP, vmreadz(HOST_IA32_SYSENTER_EIP));
+	vmwrite(GUEST_IA32_SYSENTER_ESP, vmreadz(HOST_IA32_SYSENTER_ESP));
+	vmwrite(GUEST_IA32_SYSENTER_EIP, vmreadz(HOST_IA32_SYSENTER_EIP));
 }
 
 static void evmm_init_host_state(void *host_rip, void *host_rsp)
 {
-	vmwrite(HOST_RIP, (__u64)host_rip);
-	vmwrite(HOST_RSP, (__u64)host_rsp);
+	if (host_rip)
+		vmwrite(HOST_RIP, (__u64)host_rip);
+	if (host_rsp)
+		vmwrite(HOST_RSP, (__u64)host_rsp);
 	vmwrite(HOST_CR0, read_cr0());
 	vmwrite(HOST_CR3, __read_cr3());
 	vmwrite(HOST_CR4, __read_cr4());
-	vmwrite(HOST_CS_SELECTOR, get_cs() & ~0x7);
+	vmwrite(HOST_CS_SELECTOR, get_cs() & ~0x7); //__KERNEL_CS?
 	vmwrite(HOST_SS_SELECTOR, get_ss() & ~0x7);
 	vmwrite(HOST_DS_SELECTOR, get_ds() & ~0x7);
 	vmwrite(HOST_ES_SELECTOR, get_es() & ~0x7);
@@ -233,11 +282,15 @@ static void evmm_init_host_state(void *host_rip, void *host_rsp)
 	vmwrite(HOST_FS_BASE, evmm_rdmsr_unsafe(MSR_FS_BASE));
 	vmwrite(HOST_GDTR_BASE, get_gdt().address);
 	vmwrite(HOST_IDTR_BASE, get_idt().address);
-	vmwrite(HOST_TR_BASE,
-		get_desc64_base(
-		    (struct desc64 *)(get_gdt().address + (get_tr() & ~0x7))));
 	vmwrite(HOST_IA32_PAT_COND, evmm_rdmsr_unsafe(MSR_IA32_CR_PAT));
 	vmwrite(HOST_IA32_EFER_COND, evmm_rdmsr_unsafe(MSR_EFER));
+
+	vmwrite(HOST_TR_BASE,
+		(unsigned long)&get_cpu_entry_area(smp_processor_id())
+		    ->tss.x86_tss);
+
+	void *gdt = get_current_gdt_ro();
+	vmwrite(HOST_GDTR_BASE, (unsigned long)gdt);
 }
 
 static void evmm_init_control_state(phys_addr_t msr_bitmap_phys_addr,
@@ -246,15 +299,16 @@ static void evmm_init_control_state(phys_addr_t msr_bitmap_phys_addr,
 	vmwrite(CONTROL_ADDRESS_OF_MSR_BITMAPS_COND, msr_bitmap_phys_addr);
 	vmwrite(CONTROL_CR0_GUEST_HOST_MASK, 0);
 	vmwrite(CONTROL_CR4_GUEST_HOST_MASK, 0);
-	vmwrite(CONTROL_EXCEPTION_BITMAP,
-		0xFFFFFFFF); // does this mean trap on all exceptions?
+	// vmwrite(CONTROL_EXCEPTION_BITMAP,
+	// 	0xFFFFFFFF); // does this mean trap on all exceptions?
+	vmwrite(CONTROL_EXCEPTION_BITMAP, 0);
 
-	vmwrite(CONTROL_CR0_READ_SHADOW, read_cr0());
-	vmwrite(CONTROL_CR4_READ_SHADOW, __read_cr4());
+	vmwrite(CONTROL_CR0_READ_SHADOW, vmreadz(HOST_CR0));
+	vmwrite(CONTROL_CR4_READ_SHADOW, vmreadz(HOST_CR4));
 
 	// TODO: remove after research
 	if (!basic_msr.bits.true_controls)
-		pr_warn("evmm: basic_msr.bits.true_controls is set to 1\n");
+		pr_warn("evmm: basic_msr.bits.true_controls is set to 0\n");
 
 	union ia32_vmx_entry_ctls_msr entry_ctls;
 	entry_ctls.full = 0;
@@ -330,9 +384,9 @@ static void evmm_init_vmcs(phys_addr_t msr_bitmap_phys_addr,
 			   union ia32_vmx_basic_msr basic_msr, void *host_rip,
 			   void *host_rsp, void *guest_rip, void *guest_rsp)
 {
-	evmm_init_control_state(msr_bitmap_phys_addr, basic_msr);
 	evmm_init_host_state(host_rip, host_rsp);
 	evmm_init_guest_state(guest_rip, guest_rsp);
+	evmm_init_control_state(msr_bitmap_phys_addr, basic_msr);
 }
 /*
  * When this function returns successfully, vcpu->vmcs is initialized, current
@@ -366,8 +420,6 @@ static int evmm_vcpu_init(struct evmm_vcpu *vcpu, void *host_entrypoint,
 		return -EIO;
 	}
 
-	vcpu->host_rsp = (void *)((u8 *)vcpu->host_stack + HOST_STACK_SIZE);
-
 	/*
 	 * '__vmx_vcpu_run' puts vcpu* on top of the host stack to be passed to
 	 * '__vmx_host_entrypoint'
@@ -375,8 +427,10 @@ static int evmm_vcpu_init(struct evmm_vcpu *vcpu, void *host_entrypoint,
 
 	void *guest_rsp = (void *)((u8 *)vcpu->guest_stack + GUEST_STACK_SIZE);
 
-	evmm_init_vmcs(vcpu->msr_bitmap_phys, basic_msr, host_entrypoint,
-		       vcpu->host_rsp, guest_entrypoint, guest_rsp);
+	evmm_init_vmcs(vcpu->msr_bitmap_phys, basic_msr, host_entrypoint, NULL,
+		       guest_entrypoint, guest_rsp);
+
+	vcpu->guest_rip = vmreadz(GUEST_RIP);
 
 	return 0;
 }
@@ -425,23 +479,15 @@ static struct evmm_vcpu *evmm_vcpu_create(void)
 		goto err_free_msr;
 	}
 
-	vcpu->guest_stack = (void *)kzalloc(GUEST_STACK_SIZE, GFP_KERNEL);
+	vcpu->guest_stack = (void *)__get_free_page(GFP_KERNEL | __GFP_ZERO);
 	if (!vcpu->guest_stack) {
 		pr_err("evmm: failed to allocate vcpu guest stack region.\n");
 		goto err_free_msr;
 	}
 
-	vcpu->host_stack = (void *)kzalloc(HOST_STACK_SIZE, GFP_KERNEL);
-	if (!vcpu->host_stack) {
-		pr_err("evmm: failed to allocate host stack region.\n");
-		goto err_free_guest_stack;
-	}
-
 	pr_debug("evmm: vcpu created.\n");
 	return vcpu;
 
-err_free_guest_stack:
-	kfree(vcpu->guest_stack);
 err_free_msr:
 	free_page((unsigned long)vcpu->msr_bitmap);
 err_free_vmcs:
@@ -459,16 +505,21 @@ static void evmm_vcpu_destroy(struct evmm_vcpu *vcpu)
 		return;
 	}
 
+	preempt_disable();
+
 	int err = vmclear((__u64)vcpu->vmcs_region_phys);
 	if (err) {
 		pr_err("evmm: 'vmclear' failed with %d.\nreturning early.\n",
 		       err);
 		return;
 	}
-	pr_debug("evmm: 'vmclear' done.\n");
+
+	pr_info("evmm: 'vmclear' on core #%d done.\n", smp_processor_id());
+
+	preempt_enable();
 
 	if (vcpu->guest_stack) {
-		kfree(vcpu->guest_stack);
+		free_page((unsigned long)vcpu->guest_stack);
 		pr_debug("evmm: 'vcpu->guest_stack' freed.\n");
 	}
 	if (vcpu->msr_bitmap) {
@@ -480,16 +531,9 @@ static void evmm_vcpu_destroy(struct evmm_vcpu *vcpu)
 		pr_debug("evmm: 'vcpu->vmcs_region' freed.\n");
 	}
 
-	if (vcpu->host_stack) {
-		kfree(vcpu->host_stack);
-		vcpu->host_stack = NULL;
-		vcpu->host_rsp = NULL;
-		pr_debug("evmm: 'vcpu->host_stack' freed.\n");
-	}
-
 	kfree(vcpu);
 
-	pr_debug("evmm: vcpu destroyed.\n");
+	pr_info("evmm: vcpu destroyed.\n");
 }
 
 /* Section: Initialize logical CPU(s) and run VMXON */
@@ -768,64 +812,139 @@ static long evmm_ioctl(struct file *filp, unsigned int ioctl, unsigned long arg)
 			return -ENOMEM;
 		}
 
-		/*
-		 * TODO:
-		 * MVP instantly runs the created vcpu which is not desirable.
-		 */
+		// TODO: this MVP instantly runs the created vcpu which is not
+		// desirable.
 
 		preempt_disable();
-
 		evmm_vcpu_init(vcpu, __vmx_host_entrypoint,
 			       temp_guest_entrypoint);
+		vcpu->last_core_id = smp_processor_id();
+		preempt_notifier_init(&vcpu->pn, &evmm_preempt_ops);
+		preempt_notifier_register(&vcpu->pn);
+		preempt_enable();
 
-		int ret = __vmx_vcpu_run(vcpu);
-		pr_debug("evmm: VMLAUNCH: '__vmx_vcpu_run' ret: %d", ret);
-		if (!ret) {
-			for (;;) {
-				ret = evmm_exit_handler(vcpu);
-				if (ret) {
-					pr_warn(
-					    "evmm: exit handler returned: %d - "
-					    "aborting...\n",
-					    ret);
-					ret = 0;
-					goto out;
-				} else {
-					ret = __vmx_vcpu_run(vcpu);
-					pr_debug("evmm: VMRESUME: "
-						 "'__vmx_vcpu_run' ret: %d",
-						 ret);
-					if (ret)
-						goto out;
-				}
+		int ret;
+
+		while (1) {
+
+			if (signal_pending(current)) {
+				pr_info(
+				    "evmm: signal pending, exiting VMM loop\n");
+				goto out;
+			}
+
+			preempt_disable();
+			local_irq_disable();
+
+			evmm_init_host_state(NULL, NULL);
+
+			vmwrite(GUEST_RIP, (u64)vcpu->guest_rip);
+
+			volatile unsigned long dd = 0xDEADBEEFCAFE;
+
+			ret = __vmx_vcpu_run(vcpu);
+
+			evmm_save_exit_info(vcpu);
+
+			if (dd != 0xDEADBEEFCAFE) {
+				local_irq_enable();
+				preempt_enable();
+				panic("EVMM: Stack corruption detected! "
+				      "Variable dd overwritten.");
+			}
+
+			local_irq_enable();
+			preempt_enable();
+
+			if (unlikely(ret)) {
+				// TODO: refactor and move to exit handler
+				unsigned long error =
+				    vmreadz(VMEXIT_INFO_VM_INSTRUCTION_ERROR);
+				pr_err("evmm: VMLAUNCH failed! Error code: %d. "
+				       "Instruction "
+				       "Error: %lu\n",
+				       ret, error);
+				goto out;
+			}
+
+			ret = evmm_exit_handler(vcpu);
+			if (unlikely(ret)) {
+				pr_warn("evmm: exit handler returned: %d - "
+					"aborting...\n",
+					ret);
+				goto out;
+			}
+
+			if (need_resched()) {
+				pr_info("evmm: need resched\n");
+				cond_resched();
 			}
 		}
 
 	out:
-		if (ret) {
-			// TODO: move to exit handler
-			unsigned long error =
-			    vmreadz(VMEXIT_INFO_VM_INSTRUCTION_ERROR);
-			pr_err("evmm: VMLAUNCH failed! Error code: %d. "
-			       "Instruction "
-			       "Error: %lu\n",
-			       ret, error);
-		}
-
+		preempt_notifier_unregister(&vcpu->pn);
 		evmm_vcpu_destroy(vcpu);
-
-		preempt_enable();
 
 		int t = 69;
 		if (copy_to_user(argp, &t, sizeof(t)))
 			return -EFAULT;
 
 		// TODO: return vcpu fd and store vcpu somewhere (?)
+		pr_info("ioctl returned.\n");
 		return 0;
 	}
 	default:
 		return -ENOTTY;
 	}
+}
+
+static void sched_in(struct preempt_notifier *notifier, int cpu)
+{
+
+	int pc = preempt_count();
+	if (pc == 0) {
+		pr_err("evmm: BUG! sched_in called with preemption enabled!\n");
+	}
+
+	struct evmm_vcpu *vcpu = container_of(notifier, struct evmm_vcpu, pn);
+
+	__u32 abort_ind = vcpu->vmcs_region->abort_indicator;
+	if (abort_ind)
+		pr_alert("evmm: sched_in: abort_indicator: %d - core: #%d",
+			 abort_ind, smp_processor_id());
+
+	if (cpu != vcpu->last_core_id)
+		pr_info("evmm: sched_in: moving vmcs %d --> %d\n",
+			vcpu->last_core_id, cpu);
+
+	int err = vmptrld((__u64)vcpu->vmcs_region_phys);
+	if (err) {
+		pr_err("evmm: 'vmptrld' failed with %d.\n", err);
+	}
+
+	evmm_init_host_state(NULL, NULL);
+
+	vmwrite(GUEST_RIP, (u64)vcpu->guest_rip);
+
+	vcpu->last_core_id = cpu;
+}
+
+static void sched_out(struct preempt_notifier *notifier,
+		      struct task_struct *next)
+{
+	struct evmm_vcpu *vcpu = container_of(notifier, struct evmm_vcpu, pn);
+
+	__u32 abort_ind = vcpu->vmcs_region->abort_indicator;
+	if (abort_ind)
+		pr_alert("evmm: sched_out: abort_indicator: %d - core: #%d",
+			 abort_ind, smp_processor_id());
+
+	int err = vmclear((__u64)vcpu->vmcs_region_phys);
+	if (err) {
+		pr_err("evmm: 'vmclear' failed with %d.\n", err);
+	}
+
+	vcpu->launched = 0;
 }
 
 // static struct file_operations evmm_vcpu_ops = {
@@ -885,12 +1004,17 @@ static int __init evmm_init(void)
 		goto cpu_cleanup;
 	}
 
+	preempt_notifier_inc();
+	evmm_preempt_ops.sched_in = sched_in;
+	evmm_preempt_ops.sched_out = sched_out;
+
 	pr_info("evmm: successfully initialized.\n");
 
 	return 0;
 
 cpu_cleanup:
 	on_each_cpu(evmm_cpu_exit, NULL, 1);
+	preempt_notifier_dec();
 	return ret;
 
 #endif
@@ -900,6 +1024,7 @@ cpu_cleanup:
 
 static void __exit evmm_exit(void)
 {
+	preempt_notifier_dec();
 	on_each_cpu(evmm_cpu_exit, NULL, 1);
 	misc_deregister(&evmm_dev);
 	pr_info("evmm: cleanup successful.\n");

@@ -12,7 +12,10 @@
 
 #define EVMM_EXIT_REASON_EXCEPTION_OR_NMI 0
 #define EVMM_EXIT_REASON_EXT_INTR 1
+#define EVMM_EXIT_REASON_INIT 3
 #define EVMM_EXIT_REASON_HLT 12
+#define EVMM_EXIT_REASON_VMCALL 18
+#define EVMM_EXIT_REASON_VMX_PREEMPT_TIMER_EXPIRED 52
 
 struct evmm_vmxon_region {
 	union {
@@ -31,16 +34,30 @@ struct evmm_vcpu {
 	phys_addr_t vmcs_region_phys;
 	void *msr_bitmap;
 	phys_addr_t msr_bitmap_phys;
-	void *orig_host_rsp; // the kernel stack that has initiated a vm run
-	void *host_stack;    // base address of stack
-	void *host_rsp;	     // rsp to be used for passing vcpu*
-	u64 launched;
+	// the kernel stack that has initiated a vm run
+	void *orig_host_rsp;
+	// base address of stack - TODO: no longer required. When this field is
+	// removed, stub.s must be updated too.
+	void *host_stack;
+	// rsp to be used for passing vcpu*
+	void *host_rsp;
+	u32 launched;
+	s32 last_core_id;
 	struct {
 		__u64 rax, rcx, rdx, rbx;
-		__u64 rsp, rbp, rsi, rdi;
+		__u64 rbp, rsi, rdi;
 		__u64 r8, r9, r10, r11;
 		__u64 r12, r13, r14, r15;
 	} gprs;
+	u64 guest_rip;
+	struct {
+		union evmm_vmcs_vmexit_reason exit_reason;
+		union evmm_vmcs_vmexit_intr_info intr_info;
+		u32 instruction_length;
+	} exit_info;
+	// TODO: #ifdef CONFIG_PREEMPT_NOTIFIERS
+	struct preempt_notifier pn;
+	// #endif
 };
 
 // per physical/logical cpu config
@@ -64,21 +81,6 @@ extern int __vmx_vcpu_run(struct evmm_vcpu *vcpu);
  * returns with 0.
  */
 extern void __vmx_host_entrypoint(void);
-
-struct desc64 {
-	uint16_t limit0;
-	uint16_t base0;
-	unsigned base1 : 8, type : 4, s : 1, dpl : 2, p : 1;
-	unsigned limit1 : 4, avl : 1, l : 1, db : 1, g : 1, base2 : 8;
-	uint32_t base3;
-	uint32_t zero1;
-} __attribute__((packed));
-
-static inline uint64_t get_desc64_base(const struct desc64 *desc)
-{
-	return ((uint64_t)desc->base3 << 32) |
-	       (desc->base0 | ((desc->base1) << 16) | ((desc->base2) << 24));
-}
 
 /* VMX Instructions */
 
