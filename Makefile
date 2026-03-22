@@ -66,6 +66,7 @@ _auto-install:
 		sudo rmmod $(MODULE_NAME) || true; \
 	fi
 	@echo "Installing module $(MODULE_NAME)..."
+	sudo modprobe -r kvm_intel
 	sudo insmod $(PWD)/$(MODULE_NAME).ko
 	@echo "Module installed successfully!"
 
