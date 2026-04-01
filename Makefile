@@ -1,8 +1,10 @@
 MODULE_NAME := evmm
 obj-m := $(MODULE_NAME).o
 $(MODULE_NAME)-objs := evmm_main.o \
-                      arch/x86_64/vmx/msr.o \
-                      arch/x86_64/vmx/stub.o
+                    arch/x86_64/vmx/msr.o \
+					arch/x86_64/vmx/vmx.o \
+					arch/x86_64/vmx/vcpu.o \
+                    arch/x86_64/vmx/stub.o
 
 KDIR := /lib/modules/$(shell uname -r)/build
 
@@ -16,9 +18,7 @@ SIGN_CERT ?= $(HOME)/.mok/dev-signing-key.der
 # sign-file script provided by the kernel
 SIGN_TOOL := $(KDIR)/scripts/sign-file
 
-all: build _auto-install status
-
-sign: build _sign-module
+all: build sign install
 
 install: _auto-install status
 
@@ -56,7 +56,7 @@ lint:
 	bear -- $(MAKE) build
 	python3 filter_compile_commands.py
 
-_sign-module:
+sign:
 	$(SIGN_TOOL) sha256 $(SIGN_KEY) $(SIGN_CERT) $(PWD)/$(MODULE_NAME).ko
 
 _auto-install:
@@ -70,4 +70,4 @@ _auto-install:
 	sudo insmod $(PWD)/$(MODULE_NAME).ko
 	@echo "Module installed successfully!"
 
-.PHONY: all sign install build status remove dmesg clean lint _sign-module _auto-install
+.PHONY: all sign install build status remove dmesg clean lint _auto-install

@@ -1,6 +1,7 @@
 #ifndef EVMM_ARCH_X86_64_VMX_H
 #define EVMM_ARCH_X86_64_VMX_H
 
+#include "linux/init.h"
 #include <asm/desc_defs.h>
 #include <asm/segment.h>
 #include <linux/compiler_attributes.h>
@@ -8,7 +9,6 @@
 #include <linux/types.h>
 
 #include "msr.h"
-#include "vmcs.h"
 
 #define EVMM_EXIT_REASON_EXCEPTION_OR_NMI 0
 #define EVMM_EXIT_REASON_EXT_INTR 1
@@ -17,48 +17,8 @@
 #define EVMM_EXIT_REASON_VMCALL 18
 #define EVMM_EXIT_REASON_VMX_PREEMPT_TIMER_EXPIRED 52
 
-struct evmm_vmxon_region {
-	union {
-		__u32 full;
-		struct {
-			__u32 revision_identifier : 31;
-			__u32 must_be_zeroed : 1;
-		} bits;
-	} header;
-} __packed;
-
-// per vcpu config
-struct evmm_vcpu {
-	void *guest_stack;
-	struct evmm_vmcs *vmcs_region;
-	phys_addr_t vmcs_region_phys;
-	void *msr_bitmap;
-	phys_addr_t msr_bitmap_phys;
-	// the kernel stack that has initiated a vm run
-	void *orig_host_rsp;
-	// base address of stack - TODO: no longer required. When this field is
-	// removed, stub.s must be updated too.
-	void *host_stack;
-	// rsp to be used for passing vcpu*
-	void *host_rsp;
-	u32 launched;
-	s32 last_core_id;
-	struct {
-		__u64 rax, rcx, rdx, rbx;
-		__u64 rbp, rsi, rdi;
-		__u64 r8, r9, r10, r11;
-		__u64 r12, r13, r14, r15;
-	} gprs;
-	u64 guest_rip;
-	struct {
-		union evmm_vmcs_vmexit_reason exit_reason;
-		union evmm_vmcs_vmexit_intr_info intr_info;
-		u32 instruction_length;
-	} exit_info;
-	// TODO: #ifdef CONFIG_PREEMPT_NOTIFIERS
-	struct preempt_notifier pn;
-	// #endif
-};
+void __init evmm_cpu_init(void *info);
+void evmm_cpu_exit(void *info);
 
 // per physical/logical cpu config
 struct evmm_percpu_config {
@@ -70,17 +30,15 @@ struct evmm_percpu_config {
 	bool vmxon;
 };
 
-/*
- * returns 1 on VMfailValid or 2 on VMfailInvalid.
- * on success, it will return 0 via a VM exit.
- */
-extern int __vmx_vcpu_run(struct evmm_vcpu *vcpu);
-
-/*
- * cpu jumps to this routine on VM exits, stack is restored and '__vmx_vcpu_run'
- * returns with 0.
- */
-extern void __vmx_host_entrypoint(void);
+struct evmm_vmxon_region {
+	union {
+		__u32 full;
+		struct {
+			__u32 revision_identifier : 31;
+			__u32 must_be_zeroed : 1;
+		} bits;
+	} header;
+} __packed;
 
 /* VMX Instructions */
 
@@ -243,32 +201,25 @@ static inline __u32 evmm_adjust_control_field(unsigned int msr, __u64 value)
 	return (((__u32)value | allowed_0) & allowed_1);
 }
 
-// static inline unsigned long read_dr_safe(unsigned int n)
+// static inline unsigned long read_dr_safe(unsigned
+// int n)
 // {
 // 	unsigned long val;
 
 // 	preempt_disable(); /* stay on same CPU */
 // 	switch (n) {
 // 	case 0:
-// 		asm volatile("mov %%dr0, %0" : "=r"(val));
-// 		break;
-// 	case 1:
-// 		asm volatile("mov %%dr1, %0" : "=r"(val));
-// 		break;
-// 	case 2:
-// 		asm volatile("mov %%dr2, %0" : "=r"(val));
-// 		break;
-// 	case 3:
-// 		asm volatile("mov %%dr3, %0" : "=r"(val));
+// 		asm volatile("mov %%dr0, %0" :
+// "=r"(val)); 		break; 	case 1: 		asm volatile("mov
+// %%dr1, %0" : "=r"(val)); 		break; 	case 2: 		asm
+// volatile("mov %%dr2, %0" : "=r"(val)); 		break; 	case
+// 3: 		asm volatile("mov %%dr3, %0" : "=r"(val));
 // 		break;
 // 	case 6:
-// 		asm volatile("mov %%dr6, %0" : "=r"(val));
-// 		break;
-// 	case 7:
-// 		asm volatile("mov %%dr7, %0" : "=r"(val));
-// 		break;
-// 	default:
-// 		val = 0; /* invalid register */
+// 		asm volatile("mov %%dr6, %0" :
+// "=r"(val)); 		break; 	case 7: 		asm volatile("mov
+// %%dr7, %0" : "=r"(val)); 		break; 	default: 		val = 0;
+// /* invalid register */
 // 	}
 // 	preempt_enable();
 // 	return val;
